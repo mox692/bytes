@@ -99,6 +99,7 @@ use crate::{offset_from, Buf, BytesMut};
 /// └─────┴─────┴───────────┴───────────────┴─────┘
 /// ```
 pub struct Bytes {
+    // 先頭ptr
     ptr: *const u8,
     len: usize,
     // inlined "trait object"
@@ -1278,6 +1279,7 @@ unsafe fn shared_drop(data: &mut AtomicPtr<()>, _ptr: *const u8, _len: usize) {
     });
 }
 
+// TODOS: このptrは何? -> sharedpyt
 unsafe fn shallow_clone_arc(shared: *mut Shared, ptr: *const u8, len: usize) -> Bytes {
     let old_size = (*shared).ref_cnt.fetch_add(1, Ordering::Relaxed);
 

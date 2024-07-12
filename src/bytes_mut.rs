@@ -600,6 +600,7 @@ impl BytesMut {
         self.reserve_inner(additional);
     }
 
+    // MEMO: ここの複雑さすごい
     // In separate function to allow the short-circuits in `reserve` to
     // be inline-able. Significant helps performance.
     fn reserve_inner(&mut self, additional: usize) {
@@ -1051,12 +1052,14 @@ impl Drop for BytesMut {
             unsafe {
                 let off = self.get_vec_pos();
 
+                // MEMO: わざわざvecにしてfreeしてるのはなんで？？
                 // Vector storage, free the vector
                 let _ = rebuild_vec(self.ptr.as_ptr(), self.len, self.cap, off);
             }
         } else if kind == KIND_ARC {
             unsafe { release_shared(self.data) };
         }
+        // dropだから, match しなかった時のpanicを書いてないのだろうか.
     }
 }
 
@@ -1271,6 +1274,7 @@ impl fmt::Write for BytesMut {
 
 impl Clone for BytesMut {
     fn clone(&self) -> BytesMut {
+        // MEMO: deref [u8] を実装している
         BytesMut::from(&self[..])
     }
 }
