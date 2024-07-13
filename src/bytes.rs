@@ -103,6 +103,9 @@ pub struct Bytes {
     ptr: *const u8,
     len: usize,
     // inlined "trait object"
+    // MEMO: 下記のようなケースがある
+    // * Box<Shared> (cloneされた時)
+    // * ptr +-1 (Vec<u8>とから作成した時)
     data: AtomicPtr<()>,
     vtable: &'static Vtable,
 }
@@ -113,7 +116,9 @@ pub(crate) struct Vtable {
     /// fn(data, ptr, len)
     ///
     /// takes `Bytes` to value
+    /// bytes -> vecへの変換
     pub to_vec: unsafe fn(&AtomicPtr<()>, *const u8, usize) -> Vec<u8>,
+    /// bytes -> bytes_mutへの変換
     pub to_mut: unsafe fn(&AtomicPtr<()>, *const u8, usize) -> BytesMut,
     /// fn(data)
     pub is_unique: unsafe fn(&AtomicPtr<()>) -> bool,
@@ -855,11 +860,14 @@ impl From<Vec<u8>> for Bytes {
         let cap = vec.capacity();
 
         // Avoid an extra allocation if possible.
+        // TODOS: なんでこの時だけ?
+        // -> 多分, shrink_to_fit がreallocしない
         if len == cap {
             let vec = ManuallyDrop::into_inner(vec);
             return Bytes::from(vec.into_boxed_slice());
         }
 
+        // len != cap の場合, into_boxed_sliceよりも新しい Shared をallocする
         let shared = Box::new(Shared {
             buf: ptr,
             cap,
@@ -882,6 +890,7 @@ impl From<Vec<u8>> for Bytes {
     }
 }
 
+// TODOS: Boxed sliceってのがなんで要るの?
 impl From<Box<[u8]>> for Bytes {
     fn from(slice: Box<[u8]>) -> Bytes {
         // Box<[u8]> doesn't contain a heap allocation for empty slices,
@@ -895,10 +904,12 @@ impl From<Box<[u8]>> for Bytes {
         let ptr = Box::into_raw(slice) as *mut u8;
 
         if ptr as usize & 0x1 == 0 {
+            // MEMO: addrの下位1bitをflagに使ってるのね
             let data = ptr_map(ptr, |addr| addr | KIND_VEC);
             Bytes {
                 ptr,
                 len,
+                // ptrとdataの違いは, ほぼない？？...
                 data: AtomicPtr::new(data.cast()),
                 vtable: &PROMOTABLE_EVEN_VTABLE,
             }
@@ -906,6 +917,7 @@ impl From<Box<[u8]>> for Bytes {
             Bytes {
                 ptr,
                 len,
+                // TODOS: この場合のkindは, (下位が初めから1なので) KIND_VEC になる
                 data: AtomicPtr::new(ptr.cast()),
                 vtable: &PROMOTABLE_ODD_VTABLE,
             }
@@ -943,7 +955,9 @@ impl From<String> for Bytes {
 
 impl From<Bytes> for Vec<u8> {
     fn from(bytes: Bytes) -> Vec<u8> {
+        // Bytesのdropは, おそらくto_vec implで実施されると思われる
         let bytes = ManuallyDrop::new(bytes);
+        // 詳細は to_vec impl を見る
         unsafe { (bytes.vtable.to_vec)(&bytes.data, bytes.ptr, bytes.len) }
     }
 }
@@ -975,6 +989,7 @@ unsafe fn static_clone(_: &AtomicPtr<()>, ptr: *const u8, len: usize) -> Bytes {
 }
 
 unsafe fn static_to_vec(_: &AtomicPtr<()>, ptr: *const u8, len: usize) -> Vec<u8> {
+    // MEMO: vecにも from_raw_parts があるが, docによると highly unsafe らしい...
     let slice = slice::from_raw_parts(ptr, len);
     slice.to_vec()
 }
@@ -994,6 +1009,7 @@ unsafe fn static_drop(_: &mut AtomicPtr<()>, _: *const u8, _: usize) {
 
 // ===== impl PromotableVtable =====
 
+// TODOS: comment
 static PROMOTABLE_EVEN_VTABLE: Vtable = Vtable {
     clone: promotable_even_clone,
     to_vec: promotable_even_to_vec,
@@ -1002,6 +1018,7 @@ static PROMOTABLE_EVEN_VTABLE: Vtable = Vtable {
     drop: promotable_even_drop,
 };
 
+// TODOS: comment
 static PROMOTABLE_ODD_VTABLE: Vtable = Vtable {
     clone: promotable_odd_clone,
     to_vec: promotable_odd_to_vec,
@@ -1018,6 +1035,8 @@ unsafe fn promotable_even_clone(data: &AtomicPtr<()>, ptr: *const u8, len: usize
         shallow_clone_arc(shared.cast(), ptr, len)
     } else {
         debug_assert_eq!(kind, KIND_VEC);
+        // 元のPtrと同じものを抽出している
+        // TODOS: これ, ptrじゃダメなの?
         let buf = ptr_map(shared.cast(), |addr| addr & !KIND_MASK);
         shallow_clone_vec(data, shared, buf, ptr, len)
     }
@@ -1080,6 +1099,7 @@ unsafe fn promotable_to_mut(
 
 unsafe fn promotable_even_to_vec(data: &AtomicPtr<()>, ptr: *const u8, len: usize) -> Vec<u8> {
     promotable_to_vec(data, ptr, len, |shared| {
+        // MEMO: kind_maskを消す
         ptr_map(shared.cast(), |addr| addr & !KIND_MASK)
     })
 }
@@ -1159,6 +1179,8 @@ unsafe fn free_boxed_slice(buf: *mut u8, offset: *const u8, len: usize) {
 
 // ===== impl SharedVtable =====
 
+// 使用例:
+// Vec<u8> -> Byteの変換
 struct Shared {
     // Holds arguments to dealloc upon Drop, but otherwise doesn't use them
     buf: *mut u8,
@@ -1297,8 +1319,11 @@ unsafe fn shallow_clone_arc(shared: *mut Shared, ptr: *const u8, len: usize) -> 
 
 #[cold]
 unsafe fn shallow_clone_vec(
+    // Sharedを格納しているatomic Ptrの参照
     atom: &AtomicPtr<()>,
+    // ↑のatomicPtrの展開
     ptr: *const (),
+    // たぶん head pointer of this bytes
     buf: *mut u8,
     offset: *const u8,
     len: usize,
